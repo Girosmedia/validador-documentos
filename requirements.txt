@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+python-multipart
+PyMuPDF
+Pillow
+langchain-community
+langchain-core
+langchain-ollama
+langchain-google-genai
+python-dotenv
