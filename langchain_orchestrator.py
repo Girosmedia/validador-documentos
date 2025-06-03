@@ -1,30 +1,22 @@
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import os
 import json 
 from datetime import datetime
-
-# Importamos nuestros agentes
 from agents.preprocessing import preprocess_documents_chain
 from agents.classification import classify_document_chain
 from agents.extraction import extract_credit_data_chain
 from agents.validation import validate_document_data_chain
+from pydantic import BaseModel, Field # Asegúrate de que pydantic esté instalado
+
+print("EN EL ORQUESTRADOR LANGCHAIN")
+
+class DocumentBase64(BaseModel):
+    filename: str
+    base64_content: str
+    content_type: str
 
 def determine_global_status(document_results: Dict[str, Any]) -> str:
-    """
-    Determina el estado global basado en los estados individuales de los documentos.
-    
-    Lógica:
-    - Si todos los documentos están OK -> CURSADO
-    - Si al menos 1 documento está PENDIENTE_MANUAL -> PENDIENTE_REVISION_MANUAL  
-    - Si todos los documentos tienen errores -> RECHAZADA_REVISION_AUTOMATICA
-    - Si hay mezcla de OK y ERROR -> PENDIENTE_REVISION_MANUAL
-    
-    Args:
-        document_results: Diccionario con los resultados de todos los documentos
-        
-    Returns:
-        str: Estado global (CURSADO, PENDIENTE_REVISION_MANUAL, RECHAZADA_REVISION_AUTOMATICA)
-    """
+
     if not document_results:
         return "RECHAZADA_REVISION_AUTOMATICA"
     
@@ -64,17 +56,7 @@ def determine_global_status(document_results: Dict[str, Any]) -> str:
         return "PENDIENTE_REVISION_MANUAL"
 
 def generate_global_summary(document_results: Dict[str, Any], global_status: str) -> Dict[str, Any]:
-    """
-    Genera un resumen global de la solicitud basado en los resultados de los documentos.
-    
-    Args:
-        document_results: Resultados de todos los documentos
-        global_status: Estado global determinado
-        
-    Returns:
-        Dict con el resumen global
-    """
-    # Contar documentos por estado
+
     status_counts = {}
     total_errors = 0
     error_summary = []
@@ -121,20 +103,23 @@ def generate_global_summary(document_results: Dict[str, Any], global_status: str
         "error_details": error_summary if error_summary else None
     }
 
-async def main_validation_chain_processor(document_paths: List[str]) -> Dict[str, Any]:
-    """
-    Procesa una lista de documentos a través de la cadena completa de validación
-    y determina el estado global de la solicitud.
-    """
-    print(f"Orquestador LangChain iniciado para documentos: {document_paths}")
+
+async def main_validation_chain_processor(
+    documents_base64_payload: List[DocumentBase64], # ¡Ahora recibe el payload Base64!
+    client_data: Dict[str, Any] 
+) -> Dict[str, Any]:
+
+    print(f"Orquestador LangChain iniciado para {len(documents_base64_payload)} documentos Base64.")
+    print(f"Datos del cliente para validación: {json.dumps(client_data, indent=2)}")
     
     all_processed_docs_data = {}
     final_document_results = {}
     
     try:
         # --- Paso 1: Preprocesamiento de Documentos ---
-        print("\n--- Ejecutando Paso 1: Preprocesamiento de Documentos (LLM OCR) ---")
-        processed_data_by_doc = await preprocess_documents_chain(document_paths)
+        print("\n--- Ejecutando Paso 1: Preprocesamiento de Documentos (Base64 a texto/imágenes) ---")
+        # ¡Pasamos el payload completo al preprocesamiento!
+        processed_data_by_doc = await preprocess_documents_chain(documents_base64_payload)
         all_processed_docs_data.update(processed_data_by_doc)
 
         # --- Procesamiento de cada documento ---
@@ -142,66 +127,76 @@ async def main_validation_chain_processor(document_paths: List[str]) -> Dict[str
             print(f"\n--- Procesando documento: {doc_id} ---")
             
             if doc_info["status"] not in ["processed_llm_ocr", "processed_digital_pdf"]:
-                # Error en preprocesamiento
                 doc_info['validation_status'] = "ERROR"
                 doc_info['validation_errors'] = [{
                     "field": "preprocessing", 
                     "message": f"Error en preprocesamiento: {doc_info.get('error_message', 'Error desconocido')}"
                 }]
                 final_document_results[doc_id] = doc_info
-                print(f"    ❌ Error en preprocesamiento de {doc_id}")
+                print(f"    ❌ Error en preprocesamiento de {doc_id}")
                 continue
 
             # --- Paso 2: Clasificación ---
-            print(f"    📋 Clasificando {doc_id}...")
+            print(f"    📋 Clasificando {doc_id}...")
             classification_result = await classify_document_chain(raw_text=doc_info["raw_text"])
             doc_info.update(classification_result)
 
             if doc_info["classification_status"] != "classified":
-                # Error en clasificación
                 doc_info['validation_status'] = "ERROR"
                 doc_info['validation_errors'] = [{
                     "field": "classification", 
                     "message": f"Error en clasificación: {doc_info.get('classification_error', 'Error desconocido')}"
                 }]
                 final_document_results[doc_id] = doc_info
-                print(f"    ❌ Error en clasificación de {doc_id}")
+                print(f"    ❌ Error en clasificación de {doc_id}")
                 continue
 
-            print(f"    ✅ {doc_id} clasificado como: {doc_info['doc_type']}")
+            print(f"    ✅ {doc_id} clasificado como: {doc_info['doc_type']}")
 
             # --- Paso 3: Extracción ---
-            print(f"    🔍 Extrayendo datos de {doc_id}...")
-            extraction_result = await extract_credit_data_chain(
-                filepath=doc_info["filepath"], 
-                doc_type=doc_info["doc_type"]
-            )
-            doc_info.update(extraction_result)
+            print(f"    🔍 Extrayendo datos de {doc_id}...")
 
-            if doc_info["extraction_status"] != "extracted":
-                # Error en extracción
+            original_doc_b64 = next((d for d in documents_base64_payload if d.filename == doc_id), None)
+            
+            if original_doc_b64:
+                extraction_result = await extract_credit_data_chain(
+                    raw_text=doc_info["raw_text"], # Se sigue pasando el texto preprocesado
+                    doc_type=doc_info["doc_type"],
+                    base64_content=original_doc_b64.base64_content, # Pasamos el Base64 original
+                    content_type=original_doc_b64.content_type # Pasamos el content_type original
+                )
+                doc_info.update(extraction_result)
+            else:
+                # Esto no debería pasar si el flujo es correcto
+                doc_info['extraction_status'] = "failed"
+                doc_info['extraction_error'] = "Documento Base64 original no encontrado en el payload."
+                print(f"    ❌ ERROR: Documento Base64 original para {doc_id} no encontrado.")
+
+
+            if doc_info["extraction_status"] != "extracted" and doc_info["extraction_status"] != "extracted_raw_text":
                 doc_info['validation_status'] = "ERROR"
                 doc_info['validation_errors'] = [{
                     "field": "extraction", 
                     "message": f"Error en extracción: {doc_info.get('extraction_error', 'Error desconocido')}"
                 }]
                 final_document_results[doc_id] = doc_info
-                print(f"    ❌ Error en extracción de {doc_id}")
+                print(f"    ❌ Error en extracción de {doc_id}")
                 continue
 
-            print(f"    ✅ Datos extraídos de {doc_id}")
+            print(f"    ✅ Datos extraídos de {doc_id}")
 
             # --- Paso 4: Validación ---
-            print(f"    ✔️ Validando {doc_id}...")
+            print(f"    ✔️ Validando {doc_id}...")
             validation_result = await validate_document_data_chain(
                 doc_id=doc_id, 
                 doc_type=doc_info["doc_type"],
-                extracted_data=doc_info["extracted_data"]
+                extracted_data=doc_info["extracted_data"],
+                client_data=client_data 
             )
             doc_info.update(validation_result)
 
             final_document_results[doc_id] = doc_info
-            print(f"    📊 Estado de validación para {doc_id}: {doc_info['validation_status']}")
+            print(f"    📊 Estado de validación para {doc_id}: {doc_info['validation_status']}")
 
         # --- Paso 5: Determinación del Estado Global ---
         print("\n--- Determinando Estado Global de la Solicitud ---")
@@ -222,7 +217,7 @@ async def main_validation_chain_processor(document_paths: List[str]) -> Dict[str
         return {
             "validation_status": "FAILED_CRITICAL_ERROR",
             "error_message": str(e),
-            "document_results": final_document_results,
+            "document_results": final_document_results, # Incluir resultados parciales para depuración
             "global_summary": {
                 "overall_status": "FAILED_CRITICAL_ERROR",
                 "status_message": f"Error crítico en el procesamiento: {str(e)}",
